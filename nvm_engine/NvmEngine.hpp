@@ -44,7 +44,7 @@ const uint64_t KEY_CACHE_TABLE_LENGTH = 97774177;
 #define QUEUE_NUM (30)
 #define FLAG_SZ (4)
 const uint8_t INDEX_OFFSET = 4;
-const uint64_t FILE_NUM = 6 * 128;
+const uint64_t FILE_NUM = 128 * 6;
 const uint64_t MAX_KV_SIZE = VAL_MAX_SIZE + KEY_ENTRY_SIZE;
 const uint64_t TOTAL_FILE_SIZE = 68719476736;   //64G
 const uint64_t SMALL_FILE_SIZE = TOTAL_FILE_SIZE / FILE_NUM;
@@ -57,6 +57,7 @@ const uint32_t ZERO_FALG = 0;
 typedef queue<uint32_t> Space_Slice_Queue;
 typedef stack<uint32_t> Space_Slice_Stack;
 
+// 用于KV cache （一级缓存）
 struct KVEntry {
     char key[16];
     uint16_t size;
@@ -64,34 +65,39 @@ struct KVEntry {
     bool used;
 };
 
+// 用于KeyList （二级缓存）
 struct KeyEntry {
     char _key[16];
-    uint16_t _size;
-    uint32_t _val_offset;
-    uint8_t _block_num;
-    uint32_t _cnt;
+    uint16_t _size;         // value大小
+    uint32_t _val_offset;   // value在文件中位置
+    uint8_t _block_num;     // KV及元数据占多少个单位回收块
+    uint32_t _cnt;          // 用于原子性恢复的计数
 };
 
+// 回收空间的数据结构
 struct SpaceInfo {
-    uint32_t slice_offset;
-    uint8_t block_num;
+    uint32_t slice_offset;  // 回收空间在文件中的位置
+    uint8_t block_num;      // 回收空间占多少个单位回收块
 };
 
+// 自旋锁
 class spin_mutex {
-  std::atomic_flag flag = ATOMIC_FLAG_INIT;
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
 public:
-  spin_mutex() = default;
-  spin_mutex(const spin_mutex&) = delete;
-  spin_mutex& operator= (const spin_mutex&) = delete;
-  void lock() {
-    while(flag.test_and_set(std::memory_order_acquire))
-      ;
-  }
-  void unlock() {
-    flag.clear(std::memory_order_release);
-  }
+    spin_mutex() = default;
+    spin_mutex(const spin_mutex&) = delete;
+    spin_mutex& operator= (const spin_mutex&) = delete;
+    void lock() {
+        while(flag.test_and_set(std::memory_order_acquire));
+    }
+    void unlock() {
+        flag.clear(std::memory_order_release);
+    }
 };
 
+// 一级cache，存储67w个完整KV
+// get时会添加KV到cache中
+// set时若该key已存在于cache，则更新，否则不更新
 class Cache {
 private:
     KVEntry kv[KV_CACHE_LENGTH];
@@ -103,6 +109,7 @@ public:
         kv[pos].size = val_size;
         kv[pos].used = true;
     }
+    // 若该位used flag为F，则直接返回NotFound，避免了一次memcmp
     Status get(const Slice& key, string* value) {
         uint32_t pos = TO_UINT32(key.data()) % KV_CACHE_LENGTH;
         if (kv[pos].used == false) return NotFound;
@@ -127,6 +134,8 @@ public:
     }
 };
 
+// 二级cache，存储约1亿个Key及其对应offset、val_sz、block_num
+// threadLocal
 class KeyList {
 private:
     KeyEntry ke[KEY_CACHE_TABLE_LENGTH];
@@ -139,7 +148,7 @@ public:
     }
     uint32_t add(int thread_id, char* key, uint16_t size, int block_num, uint32_t offset) {
         if (ends[thread_id] == (thread_id + 1) * KE_NUM_PER_THREAD) return 0;
-        uint32_t pos = ++ends[thread_id];
+        uint32_t pos = ++ ends[thread_id];
         memcpy(ke[pos]._key, key, WKEY_SIZE);
         ke[pos]._block_num = block_num;
         ke[pos]._size = size;

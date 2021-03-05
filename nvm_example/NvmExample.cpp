@@ -53,7 +53,7 @@ LogAppender::LogAppender(const char* file_name, size_t size) {
         exit(1);
     }
 #else
-    if((_pmem.pmem_base = (char*)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, 0, 0)) == NULL) {
+    if ((_pmem.pmem_base = (char*)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, 0, 0)) == NULL) {
         perror("mmap failed");
         exit(1);
     }

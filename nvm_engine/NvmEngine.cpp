@@ -153,22 +153,25 @@ Status NvmEngine::Get(const Slice& key, std::string* value) {
         exit(1);
     }
     #endif
+
+    // 查找一级缓存
     if (cache.get(key,value) == Ok) {
         return Ok;
     }
     #ifdef TEST
-    ++get_conflict_cnt;
+    ++ get_conflict_cnt;
     #endif
+
     hash_result = TO_UINT32(key.data() + 12) % HASH_TABLE_LENGTH;
     offset = offset_hash[hash_result];
     while (offset != 0) {
-        if (in_list[hash_result]) {
+        if (in_list[hash_result]) { // 如果已经在KeyList当中
             if (memcmp(kl.get(offset)._key, key.data(), WKEY_SIZE) == 0) {
                 final_old_offset = kl.get(offset)._val_offset;
                 val_size = kl.get(offset)._size;
                 memcpy(vbuffer, key_addr + final_old_offset * SLICE_SIZE + KEY_ENTRY_SIZE, val_size);
                 *value = string(vbuffer, val_size);
-                cache.set(key, vbuffer, val_size);
+                cache.set(key, vbuffer, val_size);  // 每次get都会更新一级缓存
                 return Ok;
             }
         }
@@ -218,13 +221,14 @@ Status NvmEngine::Set(const Slice& key, const Slice& value) {
             _cnt_4 ++;
     }
     #endif
+
     if (!init_flag) {
         int end = init_thread_id ++;
         thread_id = end % THREAD_NUM;
         init_flag = true;
     }
 
-    cache.update(key, value);
+    cache.update(key, value);   // set时若该key不在一级cache中，则不更新（一级cache存储读热点数据）
     idx = TO_UINT32(key.data() + 12) % FILE_NUM;
     bool update_key = false;
 
@@ -287,7 +291,8 @@ Status NvmEngine::Set(const Slice& key, const Slice& value) {
         if (++ hash_result == HASH_TABLE_LENGTH)    hash_result = 0;
         offset = offset_hash[hash_result];
     }
-    if (!update_key) {
+    if (!update_key) {  // key不存在
+        // 优先将新key存在二级缓存KeyList当中
         uint32_t pos = kl.add(thread_id, key.data(), value.size(), block_num, final_new_offset);
         if (pos != 0) {
             offset_hash[hash_result] = pos;
@@ -309,13 +314,14 @@ Status NvmEngine::Set(const Slice& key, const Slice& value) {
     pmem_persist(key_addr + final_new_offset * SLICE_SIZE, KEY_ENTRY_SIZE + val_size + FLAG_SZ);
 
     if (update_key) {
-        stacks[thread_id][old_block_num - INDEX_OFFSET].push(final_old_offset);
+        stacks[thread_id][old_block_num - INDEX_OFFSET].push(final_old_offset); // 回收旧空间
     }
 
     return Ok;
 }
 
-uint32_t NvmEngine::get_block_offset(int block_num, uint8_t& space_block_num){
+uint32_t NvmEngine::get_block_offset(int block_num, uint8_t& space_block_num) {
+    // 优先使用回收后的空间
     for (int i = block_num - INDEX_OFFSET; i < QUEUE_NUM; ++ i) {
         if (!stacks[thread_id][i].empty()) {
             uint32_t r = stacks[thread_id][i].top();
@@ -324,6 +330,7 @@ uint32_t NvmEngine::get_block_offset(int block_num, uint8_t& space_block_num){
             return r;
         }
     }
+    // 否则使用文件末尾
     if (file_end_offset[idx] + block_num < (idx + 1) * SMALL_SLICE_NUM) {
         lock_guard<spin_mutex> lock(lock_mutex[idx]);
         uint32_t pos = file_end_offset[idx];
@@ -335,6 +342,7 @@ uint32_t NvmEngine::get_block_offset(int block_num, uint8_t& space_block_num){
     fflush(log_file);
     exit(1);
 }
+
 int NvmEngine::get_block_num(uint32_t val_size) {
     uint32_t size = val_size + KEY_ENTRY_SIZE + FLAG_SZ;
     if (size % SLICE_SIZE == 0)
@@ -342,6 +350,7 @@ int NvmEngine::get_block_num(uint32_t val_size) {
     else
         return 1 + size / SLICE_SIZE;
 }
+
 #ifdef TEST
 void NvmEngine::process_mem_usage()
 {
