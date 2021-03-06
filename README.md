@@ -1,6 +1,6 @@
 # Tair Rank13 Solution
 
-阿里云-天池：第二届数据库大赛 - Tair性能挑战赛 
+阿里云-天池：第二届数据库大赛 - Tair性能挑战
 
 第13名队伍：以上队伍成绩作废 
 
@@ -30,7 +30,7 @@
 >
 > KV数据总数量为：16 * 48M = 16 * 48 * 2^20 = 0.75 * 2^30 个 = 0.75G 个
 >
-> - 所以表示KV在AEP中位置的offset至少为 4Bytes (32 bits)，可分128片，每片中offset可用 24bits 表示
+> - 所以表示KV在AEP中位置的offset至少为 4Bytes (32 bits)，可分128片，每片中offset可用 23bits 表示
 > - 所有offset总大小为：0.75 * 2^30 * 4 = 3 GB （分片后 0.75 * 2^30 * 3 = 2.25 GB）
 > - DRAM总共只有4G，且要考虑到hash table碰撞因子，可见DRAM存储空间很紧张
 >
@@ -105,7 +105,7 @@
 
 因为数据key分布均匀，所以可以直接取key中的几位作为hash function。
 
-先用key中7个bit将其分片，再用另外23个bit计算片内offset。
+先用key中7个bit将其分片，再用另外23个bit计算片对应hash table的slot。
 
 ### 2.3. 冲突解决
 
@@ -125,7 +125,7 @@
 
 #### 2.4.3. 组合写入
 
-将要写入文件的KV先在DRAM中组合成 256B 的倍数（pmem单词写入大小为256B），再一起写入文件，可以获得大约20s的提升。
+将要写入文件的KV先在DRAM中组合成 256B 的倍数（pmem单次写入大小为256B），再一起写入文件，可以获得大约20s的提升。
 
 #### 2.4.4. 文件分片
 
@@ -153,9 +153,9 @@ set时若该key已存在于第一级cache，则更新值；否则不将其加入
 
 #### 3.2.2. 第二级cache
 
-第二级cache是一个KeyList，存储key及其value对应的offset、value_size和block_num。KeyList大大减少了hash冲突。
+第二级cache是一个KeyList，也可以当做是二级索引。存储hash值到KV（key及其value对应的offset、value_size和block_num）的映射关系。**本质上是让 尽可能多的key比较可以不访问AEP**。
 
-总共约1亿个，分线程分配从而避免线程争用。DB会有一个in_list bool数组来镖师keyList的slot是否被用。
+总共约1亿个，分线程分配从而避免线程争用。DB会有一个in_list bool数组来标识一个hash值对应的keyList的slot是否被用。
 
 这一级cache也可以算做索引的一部分。
 
@@ -163,7 +163,7 @@ set时若该key已存在于第一级cache，则更新值；否则不将其加入
 
 更新key时，若key在keyList中，也只是更新keyList。
 
-get时，若in_list数组标识key对应hash值已在keyList中，若key匹配则直接从keyList中取出offset等数据，从AEP中读到value；否则访问hash table。这样就减少了hash table中的冲突次数。
+get时，若in_list数组标识key对应hash值已在keyList中，若key匹配则直接从keyList中取出offset等数据，从AEP中读到value；否则递增递增hash值进行线性探测。这样就减少了访问AEP的次数。
 
 ### 3.3. AEP中KV存储
 
@@ -202,9 +202,9 @@ block_num为整个KV entry占用的单位回收块的个数。
 1. 查找cache，若key存在，返回value
 2. 计算key的hash_result值和其在hash table中的offset
 3. 若offset == 0，返回NotFound
-4. 通过in_list[hash_result]判断key是否在keyList中：
-   1. 若在keyList，从KeyList读取value在AEP中位置及其他信息，从AEP读出value并返回
-   2. 否则从AEP读取key，判断是否匹配，若匹配，读出value并返回。
+4. 通过in_list[hash_result]判断hash_result是否在keyList中：
+   1. 若在keyList且key匹配，从KeyList读取value在AEP中位置及其他信息，从AEP读出value并返回
+   2. 若不在KeyList，从AEP读取key，判断是否匹配，若匹配，读出value并返回。
    3. 找到key的两种情况都要更新cache
    4. 否则递增hash_result进行线性探测法，到offset==0时推出循环，返回NotFound
 
@@ -225,8 +225,8 @@ block_num为整个KV entry占用的单位回收块的个数。
 
 ## 4. 可改进之处
 
-- **分片顺序**写入能有效提高不规整（非 256B） 写入的带宽。
-- **写入地址、写入量对齐** 能有效提高带宽。
+- **分片顺序** 写入能有效提高不规整（非 256B） 写入的带宽
+- **写入地址、写入量对齐** 能有效提高带宽
 - 将pmem划分为64个片区，并将写入地址和写入量都对齐到64B可提升效率
 - 空间分配策略应优先从pmem末尾分配，末尾没空间了再从回收池中分配
 
